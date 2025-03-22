@@ -12,12 +12,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"iter"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	openpgpErrors "github.com/ProtonMail/go-crypto/openpgp/errors"
+	"github.com/opentofu/opentofu/internal/collections"
 	tfaddr "github.com/opentofu/registry-address"
 )
 
@@ -41,19 +43,65 @@ const (
 // A failed PackageAuthentication attempt will return an "unauthenticated"
 // result, which is represented by nil.
 type PackageAuthenticationResult struct {
-	result packageAuthenticationResult
-	KeyID  string
+	hashes HashDispositions
 }
 
 func (t *PackageAuthenticationResult) String() string {
 	if t == nil {
 		return "unauthenticated"
 	}
-	return []string{
-		"verified checksum",
-		"signed",
-		"signing skipped",
-	}[t.result]
+	signedCount := 0
+	registryReportCount := 0
+	locallyVerifiedCount := 0
+	for _, disp := range t.hashes {
+		if disp.SignedByAnyGPGKeys() {
+			signedCount++
+		}
+		if disp.ReportedByRegistry {
+			registryReportCount++
+		}
+		if disp.VerifiedLocally {
+			locallyVerifiedCount++
+		}
+	}
+	switch {
+	case signedCount > 0:
+		return "signed"
+	case registryReportCount > 0:
+		return "signing skipped"
+	case locallyVerifiedCount > 0:
+		return "verified checksum"
+	default:
+		return "unauthenticated"
+	}
+}
+
+// HashesWithDisposition returns a sequence of hashes whose disposition after
+// authentication matches the rule implemented by the given function cond.
+//
+// Use this to select the appropriate subset of hashes to record for the
+// associated provider version in the dependency lock file, with the selection
+// condition varying based on the authentication result and the current
+// policy for whether signature verification is required and which keys
+// are trusted.
+func (t *PackageAuthenticationResult) HashesWithDisposition(cond func(*HashDisposition) bool) iter.Seq[Hash] {
+	return func(yield func(Hash) bool) {
+		for hash, disp := range t.hashes {
+			if !cond(disp) {
+				continue
+			}
+			if keepGoing := yield(hash); !keepGoing {
+				break
+			}
+		}
+	}
+}
+
+// GPGKeyIDsString returns a UI-oriented string representation of all of the
+// GPG key IDs that asserted the validity of at least one of the hashes
+// related to this package's provider version.
+func (t *PackageAuthenticationResult) GPGKeyIDsString() string {
+	return t.hashes.AllGPGSigningKeysString()
 }
 
 // Signed returns whether the package was authenticated as signed by anyone.
@@ -61,7 +109,7 @@ func (t *PackageAuthenticationResult) Signed() bool {
 	if t == nil {
 		return false
 	}
-	return t.result == signed
+	return t.hashes.HasAnySignedByGPGKeys()
 }
 
 // SigningSkipped returns whether the package was authenticated but the key
@@ -70,7 +118,7 @@ func (t *PackageAuthenticationResult) SigningSkipped() bool {
 	if t == nil {
 		return false
 	}
-	return t.result == signingSkipped
+	return t.hashes.HasAnyReportedByRegistry()
 }
 
 // SigningKey represents a key used to sign packages from a registry. These are
@@ -147,27 +195,23 @@ type packageAuthenticationAll []PackageAuthentication
 // The checks are processed in the order given, so a failure of an earlier
 // check will prevent execution of a later one.
 //
-// The returned result is from the last authentication, so callers should
-// take care to order the authentications such that the strongest is last.
-//
-// The returned object also implements the AcceptableHashes method from
-// interface PackageAuthenticationHashes, returning the hashes from the
-// last of the given checks that indicates at least one acceptable hash,
-// or no hashes at all if none of the constituents indicate any. The result
-// may therefore be incomplete if there is more than one check that can provide
-// hashes and they disagree about which hashes are acceptable.
+// The returned result is the union of the results of all authentications,
+// describing all of the checksums that were somehow involved in the
+// authentication process and what we learned about each one along the way.
 func PackageAuthenticationAll(checks ...PackageAuthentication) PackageAuthentication {
 	return packageAuthenticationAll(checks)
 }
 
 func (checks packageAuthenticationAll) AuthenticatePackage(localLocation PackageLocation) (*PackageAuthenticationResult, error) {
-	var authResult *PackageAuthenticationResult
+	authResult := &PackageAuthenticationResult{
+		hashes: make(HashDispositions),
+	}
 	for _, check := range checks {
-		var err error
-		authResult, err = check.AuthenticatePackage(localLocation)
+		thisAuthResult, err := check.AuthenticatePackage(localLocation)
 		if err != nil {
-			return authResult, err
+			return nil, err
 		}
+		authResult.hashes.Merge(thisAuthResult.hashes)
 	}
 	return authResult, nil
 }
@@ -221,13 +265,18 @@ func (a packageHashAuthentication) AuthenticatePackage(localLocation PackageLoca
 		return nil, fmt.Errorf("this version of OpenTofu does not support any of the checksum formats given for this provider")
 	}
 
-	matches, err := PackageMatchesAnyHash(localLocation, a.RequiredHashes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to verify provider package checksums: %w", err)
+	hashes := make(HashDispositions, len(a.RequiredHashes))
+	for verifiedHash, err := range HashesMatchingPackage(localLocation, a.RequiredHashes) {
+		if err != nil {
+			return nil, fmt.Errorf("failed to verify provider package checksums: %w", err)
+		}
+		hashes[verifiedHash] = &HashDisposition{
+			VerifiedLocally: true,
+		}
 	}
 
-	if matches {
-		return &PackageAuthenticationResult{result: verifiedChecksum}, nil
+	if len(hashes) > 0 {
+		return &PackageAuthenticationResult{hashes: hashes}, nil
 	}
 	if len(a.RequiredHashes) == 1 {
 		return nil, fmt.Errorf("provider package doesn't match the expected checksum %q", a.RequiredHashes[0].String())
@@ -288,7 +337,13 @@ func (a archiveHashAuthentication) AuthenticatePackage(localLocation PackageLoca
 	if gotHash != wantHash {
 		return nil, fmt.Errorf("archive has incorrect checksum %s (expected %s)", gotHash, wantHash)
 	}
-	return &PackageAuthenticationResult{result: verifiedChecksum}, nil
+	return &PackageAuthenticationResult{
+		hashes: HashDispositions{
+			gotHash: &HashDisposition{
+				VerifiedLocally: true,
+			},
+		},
+	}, nil
 }
 
 func (a archiveHashAuthentication) AcceptableHashes() []Hash {
@@ -403,6 +458,7 @@ func (s signatureAuthentication) shouldEnforceGPGValidation() bool {
 	enforceEnvVar, exists := os.LookupEnv(enforceGPGValidationEnvName)
 	return exists && enforceEnvVar == "true"
 }
+
 func (s signatureAuthentication) shouldEnforceGPGExpiration() bool {
 	// otherwise if the environment variable is set to true, we should enforce GPG expiration
 	enforceEnvVar, exists := os.LookupEnv(enforceGPGExpirationEnvName)
@@ -412,29 +468,33 @@ func (s signatureAuthentication) shouldEnforceGPGExpiration() bool {
 func (s signatureAuthentication) AuthenticatePackage(location PackageLocation) (*PackageAuthenticationResult, error) {
 	shouldValidate := s.shouldEnforceGPGValidation()
 
-	if !shouldValidate {
+	var signingKeyIDs collections.Set[string]
+	if shouldValidate {
+		log.Printf("[DEBUG] Validating GPG signature of provider package %s", location)
+
+		_, keyID, err := s.findSigningKey()
+		if err != nil {
+			return nil, fmt.Errorf("the provider is not signed with a valid signing key; please contact the provider author (%w)", err)
+		}
+		signingKeyIDs = collections.NewSet(keyID)
+	} else {
 		// As this is a temporary measure, we will log a warning to the user making it very clear what is happening
 		// and why. This will be removed in a future release.
 		log.Printf("[WARN] Skipping GPG validation of provider package %s as no keys were provided by the registry. See https://github.com/opentofu/opentofu/pull/309 for more information.", location)
-
-		// construct an empty keyID to indicate that we are not validating and return no errors
-		// this is to force a successful authentication
-		// TODO: discuss if this key should be hardcoded to a value such as "UNKNOWN"?
-		return &PackageAuthenticationResult{result: signingSkipped, KeyID: ""}, nil
-	} else {
-		log.Printf("[DEBUG] Validating GPG signature of provider package %s", location)
 	}
 
-	// Find the key that signed the checksum file. This can fail if there is no
-	// valid signature for any of the provided keys.
-
-	_, keyID, err := s.findSigningKey()
-	if err != nil {
-		return nil, fmt.Errorf("the provider is not signed with a valid signing key; please contact the provider author (%w)", err)
+	// For each of the hashes mentioned in the document that was signed we'll announce that
+	// it was reported by the provider's origin registry, since that's the only place that
+	// this kind of signed hash file can come from, and _possibly_ report the key IDs that
+	// signed it unless we decided above that validation wasn't actually needed.
+	hashes := make(HashDispositions)
+	for _, hash := range s.AcceptableHashes() {
+		hashes[hash] = &HashDisposition{
+			ReportedByRegistry: true,
+			SignedByGPGKeyIDs:  signingKeyIDs,
+		}
 	}
-
-	// We have a valid signature.
-	return &PackageAuthenticationResult{result: signed, KeyID: keyID}, nil
+	return &PackageAuthenticationResult{hashes: hashes}, nil
 }
 
 func (s signatureAuthentication) AcceptableHashes() []Hash {

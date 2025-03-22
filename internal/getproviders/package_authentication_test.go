@@ -31,7 +31,11 @@ func TestPackageAuthenticationResult(t *testing.T) {
 			"unauthenticated",
 		},
 		{
-			&PackageAuthenticationResult{result: signed},
+			&PackageAuthenticationResult{
+				hashes: HashDispositions{
+					// TODO: Put a hash in here that has a signing key associated with it
+				},
+			},
 			"signed",
 		},
 	}
@@ -46,13 +50,13 @@ func TestPackageAuthenticationResult(t *testing.T) {
 // interface which returns fixed values. This is used to test the combining
 // logic of PackageAuthenticationAll.
 type mockAuthentication struct {
-	result packageAuthenticationResult
+	hashes HashDispositions
 	err    error
 }
 
 func (m mockAuthentication) AuthenticatePackage(localLocation PackageLocation) (*PackageAuthenticationResult, error) {
 	if m.err == nil {
-		return &PackageAuthenticationResult{result: m.result}, nil
+		return &PackageAuthenticationResult{hashes: m.hashes}, nil
 	} else {
 		return nil, m.err
 	}
